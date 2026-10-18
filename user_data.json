@@ -1,0 +1,40 @@
+{
+  "accounts": {
+    "checking": 2450,
+    "savings": 8500,
+    "crypto": 1200,
+    "stocks": 4500
+  },
+  "monthlyBudget": 300,
+  "recentTransactions": [
+    {
+      "id": 1,
+      "date": "2026-10-14",
+      "merchant": "Whole Foods",
+      "amount": 120.5,
+      "category": "Groceries",
+      "type": "expense"
+    },
+    {
+      "id": 2,
+      "date": "2026-10-16",
+      "merchant": "Netflix",
+      "amount": 15.99,
+      "category": "Subscriptions",
+      "recurring": true,
+      "type": "expense"
+    }
+  ],
+  "upcomingBills": [
+    {
+      "name": "Electricity",
+      "dueDate": "2026-10-20",
+      "amount": 85
+    },
+    {
+      "name": "Spotify",
+      "dueDate": "2026-10-22",
+      "amount": 10.99
+    }
+  ]
+}
