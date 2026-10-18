@@ -305,6 +305,56 @@ app.post('/login', (req, res) => {
 });
 
 // ==========================================
+// 4B. SAFE-TO-SPEND CALCULATION ENGINE
+// ==========================================
+function calculateSafeToSpend(userData) {
+    const now = new Date();
+    const totalDays = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+    const daysLeft = Math.max(1, totalDays - now.getDate() + 1);
+    const budget = Number(userData.monthlyIncome || userData.monthlyBudget || 0);
+    const transactions = userData.transactions || userData.recentTransactions || [];
+    const spentSoFar = transactions
+        .filter(t => t.type === 'expense' || (t.amount && t.type !== 'income'))
+        .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+    const bills = userData.bills || userData.upcomingBills || [];
+    const upcomingBills = bills
+        .filter(b => !b.paid)
+        .reduce((sum, b) => sum + (Number(b.amount) || 0), 0);
+    const remainingPool = budget - spentSoFar - upcomingBills;
+    const dailySafeToSpend = budget > 0 ? Math.round((remainingPool / daysLeft) * 100) / 100 : 0;
+    const dailyBaseline = budget > 0 ? budget / totalDays : 50;
+
+    let status = 'green';
+    let statusLabel = 'Guilt-Free Spending';
+    if (budget === 0) {
+        status = 'amber';
+        statusLabel = 'Budget Not Set';
+    } else if (dailySafeToSpend <= 0) {
+        status = 'red';
+        statusLabel = 'Spending Deficit';
+    } else if (dailySafeToSpend < Math.min(25, dailyBaseline * 0.35)) {
+        status = 'amber';
+        statusLabel = 'Pacing Tight';
+    }
+
+    return {
+        dailySafeToSpend,
+        daysLeft,
+        totalDays,
+        monthlyBudget: budget,
+        spentSoFar,
+        upcomingBills,
+        remainingPool,
+        status,
+        statusLabel
+    };
+}
+
+app.get('/api/safe-to-spend', (req, res) => {
+    res.json(calculateSafeToSpend(mockUserData));
+});
+
+// ==========================================
 // 5. MAIN API ROUTE (The Orchestrator)
 // ==========================================
 app.post('/api/chat', async (req, res) => {
@@ -371,15 +421,22 @@ app.post('/api/chat', async (req, res) => {
                 },
                 transaction: newTx,
                 recentTransactions: mockUserData.recentTransactions,
+                safe_to_spend: calculateSafeToSpend(mockUserData),
                 intent: 'log_expense'
             });
         }
 
-        const enrichedPrompt = `User's financial data: ${JSON.stringify(mockUserData)}\n\nUser's question: ${message}`;
+        const activeUserData = (req.body.userContext && Object.keys(req.body.userContext).length > 0)
+            ? { ...mockUserData, ...req.body.userContext }
+            : mockUserData;
+        const safeToSpend = calculateSafeToSpend(activeUserData);
+
+        const enrichedPrompt = `User's financial data: ${JSON.stringify(activeUserData)}\nDaily Safe-to-Spend: $${safeToSpend.dailySafeToSpend}/day (${safeToSpend.statusLabel}). Formula: ($${safeToSpend.monthlyBudget} budget - $${safeToSpend.spentSoFar} spent - $${safeToSpend.upcomingBills} bills) / ${safeToSpend.daysLeft} days remaining in month.\n\nUser's question: ${message}`;
         const result = await selectedModel.generateContent(enrichedPrompt);
         
         const aiData = JSON.parse(result.response.text());
-        console.log(`---> 3. Worker Agent generated structured response.`);
+        aiData.safe_to_spend = safeToSpend;
+        console.log(`---> 3. Worker Agent generated structured response. Safe-to-spend: $${safeToSpend.dailySafeToSpend}/day`);
         res.json(aiData);
 
     } catch (error) {
