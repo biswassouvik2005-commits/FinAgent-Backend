@@ -435,8 +435,9 @@ app.post('/api/chat', async (req, res) => {
         const result = await selectedModel.generateContent(enrichedPrompt);
         
         const aiData = JSON.parse(result.response.text());
+        aiData.intent = intent;
         aiData.safe_to_spend = safeToSpend;
-        console.log(`---> 3. Worker Agent generated structured response. Safe-to-spend: $${safeToSpend.dailySafeToSpend}/day`);
+        console.log(`---> 3. Worker Agent generated structured response. Intent: [${intent}], Safe-to-spend: $${safeToSpend.dailySafeToSpend}/day`);
         res.json(aiData);
 
     } catch (error) {
