@@ -1,12 +1,45 @@
 {
   "accounts": {
-    "checking": 2450,
+    "checking": 2425.5,
     "savings": 8500,
     "crypto": 1200,
     "stocks": 4500
   },
   "monthlyBudget": 300,
   "recentTransactions": [
+    {
+      "id": 1792432234917,
+      "date": "Oct 19",
+      "merchant": "Trader Joe's",
+      "amount": 24.5,
+      "category": "Groceries",
+      "remaining_balance": 2425.5,
+      "card_or_account": "Card ...4321",
+      "is_bank_alert": true,
+      "type": "expense"
+    },
+    {
+      "id": 1792431773161,
+      "date": "2023-10-19",
+      "merchant": "Trader Joe's",
+      "amount": 24.5,
+      "category": "Groceries",
+      "remaining_balance": 2425.5,
+      "card_or_account": "Card ...4321",
+      "is_bank_alert": true,
+      "type": "expense"
+    },
+    {
+      "id": 1792414425096,
+      "date": "Oct 19",
+      "merchant": "Trader Joe's",
+      "amount": 24.5,
+      "category": "Groceries",
+      "remaining_balance": 2425.5,
+      "card_or_account": "Card ...4321",
+      "is_bank_alert": true,
+      "type": "expense"
+    },
     {
       "id": 1,
       "date": "2026-10-14",
