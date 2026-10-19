@@ -20,7 +20,7 @@ const routerModel = genAI.getGenerativeModel({
     "expense" (spending, budgets, general questions), 
     "bills" (subscriptions, recurring costs, due dates), 
     "investments" (stocks, crypto, portfolio growth),
-    "log_expense" (when the user states or speaks an expense, purchase, or money spent to record, e.g. "Spent $14 on lunch at Subway", "Bought coffee for $5 at Starbucks").
+    "log_expense" (when the user states or speaks an expense, purchase, or money spent to record, OR pastes an automated bank/card transaction SMS alert, email receipt, or payment notification, e.g. "Chase Alert: You made a $24.50 transaction at TRADER JOE'S #542 on Oct 19 with card ending 4321. Avail bal: $2,425.50", "Citi Alert: A charge of $68.12 was approved at SHELL OIL 574423 on 10/19/2026. Ref: TXN987261. Balance: $1,280.00", "Spent $14 on lunch at Subway").
     Return ONLY the single word. Do not include punctuation.`,
 });
 
@@ -123,15 +123,20 @@ const receiptModel = genAI.getGenerativeModel({
     }
 });
 
-// E. Conversational Expense Logging Agent (4th Route Worker)
+// E. Conversational & Bank Alert Expense Logging Agent (4th Route Worker)
 const logExpenseModel = genAI.getGenerativeModel({
     model: "gemini-3.5-flash-lite",
-    systemInstruction: `You are the Conversational Expense Logging Agent.
-When a user types or speaks an expense (e.g., "Spent $14 on lunch at Subway", "Bought coffee for $4.50 at Starbucks"), extract:
-1. amount: The exact dollar amount spent as a positive number (e.g. 14).
-2. merchant: The store, restaurant, vendor, or business name (e.g. "Subway").
+    systemInstruction: `You are the Conversational & Bank Alert Expense Logging Agent.
+When a user types or speaks an expense OR pastes an automated transaction SMS alert (e.g. Chase, Citi, Wells Fargo, Amex, Apple Card, Venmo, PayPal) or email receipt:
+1. amount: The exact dollar amount spent/charged as a positive number (e.g. 24.50).
+2. merchant: Clean store or business name (strip terminal numbers, store hashes, or POS codes like "#542", "574423", e.g. "Trader Joe's", "Shell Oil").
 3. category: Suggested budget category (e.g. Dining, Groceries, Transportation, Shopping, Entertainment, Utilities, Healthcare, Other).
-4. ai_reply: A concise, friendly confirmation message confirming the expense has been recorded to their transactions.`,
+4. date: Transaction date formatted as YYYY-MM-DD or readable string, or "Today".
+5. transaction_id: Reference number, transaction ID, confirmation code, or auth code if present (or null/empty if none).
+6. remaining_balance: The account balance or available balance reported in the alert as a number (or null if not mentioned).
+7. card_or_account: The card or account mentioned in the alert (e.g. "Card ...4321", "Checking ...1234", "Apple Card") or null.
+8. is_bank_alert: true if this is an automated bank alert/SMS/push/email, false if a casual statement.
+9. ai_reply: A concise, friendly confirmation message confirming the expense has been recorded and if the balance was reconciled.`,
     generationConfig: {
         responseMimeType: "application/json",
         responseSchema: {
@@ -139,71 +144,163 @@ When a user types or speaks an expense (e.g., "Spent $14 on lunch at Subway", "B
             properties: {
                 ai_reply: { type: SchemaType.STRING, description: "Friendly confirmation message." },
                 amount: { type: SchemaType.NUMBER, description: "The amount spent in USD as a positive number." },
-                merchant: { type: SchemaType.STRING, description: "The merchant or store name." },
+                merchant: { type: SchemaType.STRING, description: "Clean merchant or business name." },
                 category: { type: SchemaType.STRING, description: "Budget category (e.g. Dining, Groceries, Transportation)." },
-                date: { type: SchemaType.STRING, description: "Transaction date or 'Today'." }
+                date: { type: SchemaType.STRING, description: "Transaction date or 'Today'." },
+                transaction_id: { type: SchemaType.STRING, description: "Transaction ID or reference number if found." },
+                remaining_balance: { type: SchemaType.NUMBER, description: "Available/remaining balance if specified." },
+                card_or_account: { type: SchemaType.STRING, description: "Card or account used if mentioned." },
+                is_bank_alert: { type: SchemaType.BOOLEAN, description: "Whether this came from an automated bank SMS/alert." }
             },
             required: ["ai_reply", "amount", "merchant", "category"]
         }
     }
 });
 
-// Robust NLP fallback parser for zero-failure local/offline expense extraction
+// Robust NLP fallback parser for zero-failure local/offline expense and bank SMS alert extraction
 function fallbackParseExpense(text) {
     if (!text || typeof text !== 'string') {
-        return { amount: 0, merchant: 'Expense', category: 'General', date: 'Today', ai_reply: 'Could not parse expense.' };
+        return {
+            amount: 0,
+            merchant: 'Expense',
+            category: 'General',
+            date: 'Today',
+            is_bank_alert: false,
+            ai_reply: 'Could not parse expense.'
+        };
     }
     const clean = text.trim();
+    const lower = clean.toLowerCase();
 
-    // Extract amount: $14, 14.50, 14 dollars, etc.
-    let amount = 0;
-    const explicitDollar = clean.match(/\$\s*(\d+(?:\.\d{1,2})?)/);
-    const spentPattern = clean.match(/(?:spent|paid|bought|cost|charged)\s*(?:\$)?\s*(\d+(?:\.\d{1,2})?)/i);
-    const genericNumber = clean.match(/(?:^|\s)(\d+(?:\.\d{1,2})?)(?:\s*(?:dollars?|bucks?|usd))?/i);
-    if (explicitDollar) {
-        amount = parseFloat(explicitDollar[1]);
-    } else if (spentPattern) {
-        amount = parseFloat(spentPattern[1]);
-    } else if (genericNumber) {
-        amount = parseFloat(genericNumber[1]);
+    // Detect bank alert indicators
+    const isBankAlert = /(?:alert|notification|authorized|approved|declined|charge of|transaction of|purchase of|avail(?:able)?\s*bal|ending bal|acct bal|balance:|ref:|txn|ref\s*#|card ending|ending in \d{4})/i.test(clean) ||
+        /^(?:chase|citi|wells fargo|bofa|bank of america|amex|apple card|capital one|venmo|paypal|discover)/i.test(clean);
+
+    // 1. Extract remaining/available balance (e.g. "Avail bal: $2,425.50", "Balance: $1,280.00", "Available balance: $3,120.45")
+    let remaining_balance;
+    const balanceMatch = clean.match(/(?:avail(?:able)?\s*bal(?:ance)?|total\s*bal(?:ance)?|acct\s*bal(?:ance)?|ending\s*bal(?:ance)?|bal(?:ance)?):?\s*\$?\s*([\d,]+(?:\.\d{2})?)/i);
+    if (balanceMatch && balanceMatch[1]) {
+        const parsedBal = parseFloat(balanceMatch[1].replace(/,/g, ''));
+        if (Number.isFinite(parsedBal)) {
+            remaining_balance = parsedBal;
+        }
     }
 
-    // Extract merchant: "at Subway", "from Starbucks", "to Uber"
+    // 2. Extract transaction amount (e.g. "$24.50 transaction", "charge of $68.12", "$14 on lunch")
+    let amount = 0;
+    const alertAmtMatch = clean.match(/(?:charge of|transaction of|purchase of|made a|payment of|spent|paid|amount:?)\s*\$?\s*([\d,]+(?:\.\d{1,2})?)/i);
+    if (alertAmtMatch && alertAmtMatch[1]) {
+        amount = parseFloat(alertAmtMatch[1].replace(/,/g, ''));
+    } else {
+        const allDollarMatches = [...clean.matchAll(/\$\s*([\d,]+(?:\.\d{1,2})?)/gi)];
+        for (const m of allDollarMatches) {
+            const val = parseFloat(m[1].replace(/,/g, ''));
+            if (remaining_balance != null && Math.abs(val - remaining_balance) < 0.001) {
+                continue;
+            }
+            amount = val;
+            break;
+        }
+        if (!amount) {
+            const genericNumber = clean.match(/(?:^|\s)(\d+(?:\.\d{1,2})?)(?:\s*(?:dollars?|bucks?|usd))?/i);
+            if (genericNumber) {
+                amount = parseFloat(genericNumber[1]);
+            }
+        }
+    }
+
+    // 3. Extract transaction ID / reference code (e.g. "Ref: TXN987261", "Txn ID: 59382", "Ref #12345")
+    let transaction_id;
+    const txnMatch = clean.match(/(?:ref(?:erence)?\s*(?:#|id|no\.?)?|txn(?:\s*id)?|auth(?:\s*code)?|confirmation\s*#?)\s*[:#]?\s*([A-Za-z0-9-]+)/i);
+    if (txnMatch && txnMatch[1]) {
+        transaction_id = txnMatch[1].trim();
+    }
+
+    // 4. Extract card or account (e.g. "card ending 4321", "card ending in 8899", "Apple Card", "Venmo", "Checking ...1234")
+    let card_or_account;
+    const cardEndingMatch = clean.match(/(?:card|acct|account)\s*(?:ending(?:\s*in)?|#)?\s*[:#]?\s*(\d{4})/i);
+    if (cardEndingMatch && cardEndingMatch[1]) {
+        card_or_account = `Card ending ${cardEndingMatch[1].trim()}`;
+    } else if (/apple card/i.test(clean)) {
+        card_or_account = 'Apple Card';
+    } else if (/venmo/i.test(clean)) {
+        card_or_account = 'Venmo';
+    } else if (/chase/i.test(clean)) {
+        card_or_account = 'Chase Checking';
+    } else if (/citi/i.test(clean)) {
+        card_or_account = 'Citi Card';
+    }
+
+    // 5. Extract merchant (e.g. "at TRADER JOE'S #542", "at SHELL OIL 574423", "Paid John Doe $35", "at Subway")
     let merchant = '';
-    const atMatch = clean.match(/(?:at|from|to|with)\s+([A-Za-z0-9\s'&]+?)(?:\s+(?:for|on|yesterday|today|with|using|in|\.|$)|$)/i);
+    const atMatch = clean.match(/(?:at|from|to|with|paid)\s+([A-Za-z0-9\s'&.#\-]+?)(?:\s*(?:\.|\$|\s+(?:for|on|yesterday|today|with|using|in|ref|ref:|txn|bal|balance|avail|total)|$))/i);
     if (atMatch && atMatch[1]) {
         merchant = atMatch[1].trim();
-    } else {
-        const commonMerchants = ['subway', 'starbucks', 'walmart', 'target', 'amazon', 'uber', 'lyft', 'shell', 'mcdonalds', 'whole foods', 'trader joe\'s'];
-        const found = commonMerchants.find(m => clean.toLowerCase().includes(m));
-        merchant = found ? (found.charAt(0).toUpperCase() + found.slice(1)) : 'Expense';
+    }
+    if (!merchant || merchant.toLowerCase() === 'card' || merchant.toLowerCase() === 'you') {
+        const commonMerchants = ['subway', 'starbucks', 'walmart', 'target', 'amazon', 'uber', 'lyft', 'shell', 'mcdonalds', 'whole foods', "trader joe's"];
+        const found = commonMerchants.find(m => lower.includes(m));
+        merchant = found ? (found.charAt(0).toUpperCase() + found.slice(1)) : (isBankAlert ? 'Card Transaction' : 'Expense');
     }
 
-    // Extract category
-    const lower = clean.toLowerCase();
+    // Clean store #, POS, terminal digits
+    merchant = merchant
+        .replace(/\s*(?:#\d+|\b\d{3,}\b|\bstore\b\s*\d*|\bpos\b).*$/i, '')
+        .trim();
+    merchant = merchant.replace(/[.#\-,]+$/, '').trim();
+
+    if (merchant.length > 2 && merchant === merchant.toUpperCase()) {
+        merchant = merchant.toLowerCase().split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+    }
+
+    // 6. Extract date (e.g. "on Oct 19", "on 10/19/2026", "on 10/18")
+    let date = 'Today';
+    const dateMatch = clean.match(/(?:on|date:?)\s+([A-Za-z]{3}\s+\d{1,2}(?:,\s*\d{4})?|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)/i);
+    if (dateMatch && dateMatch[1]) {
+        date = dateMatch[1].trim();
+    }
+
+    // 7. Extract category
     let category = 'General';
-    if (/groceries|grocery|supermarket|apples|milk|produce/i.test(lower)) {
+    const mLower = merchant.toLowerCase();
+    if (/groceries|grocery|supermarket|apples|milk|produce|trader joe|whole foods/i.test(lower) || /trader joe|safeway|kroger|aldi|publix/i.test(mLower)) {
         category = 'Groceries';
-    } else if (/lunch|dinner|breakfast|meal|food|subway|starbucks|mcdonalds|burger|sandwich|pizza|coffee|cafe|restaurant|dining|snack|drink/i.test(lower)) {
+    } else if (/lunch|dinner|breakfast|meal|food|subway|starbucks|mcdonalds|burger|sandwich|pizza|coffee|cafe|restaurant|dining|snack|drink/i.test(lower) || /starbucks|subway|mcdonald/i.test(mLower)) {
         category = 'Dining';
-    } else if (/gas|fuel|shell|chevron|exxon|uber|lyft|taxi|subway fare|train|bus|transport|parking|toll/i.test(lower)) {
+    } else if (/gas|fuel|shell|chevron|exxon|uber|lyft|taxi|subway fare|train|bus|transport|parking|toll/i.test(lower) || /shell|chevron|exxon|bp|mobil/i.test(mLower)) {
         category = 'Transportation';
     } else if (/movie|cinema|netflix|spotify|game|entertainment|concert|ticket/i.test(lower)) {
         category = 'Entertainment';
-    } else if (/clothes|shoes|amazon|target|shopping|mall|electronics|store|retail/i.test(lower)) {
+    } else if (/clothes|shoes|amazon|target|shopping|mall|electronics|store|retail/i.test(lower) || /target|walmart|amazon/i.test(mLower)) {
         category = 'Shopping';
     } else if (/bill|electric|power|water|internet|utility|utilities|wifi|phone|rent/i.test(lower)) {
         category = 'Utilities';
-    } else if (/gym|pharmacy|medicine|doctor|health|dentist/i.test(lower)) {
+    } else if (/gym|pharmacy|medicine|doctor|health|dentist/i.test(lower) || /cvs|walgreens/i.test(mLower)) {
         category = 'Healthcare';
+    }
+
+    // 8. Generate appropriate AI reply
+    let ai_reply = '';
+    if (isBankAlert) {
+        if (remaining_balance != null) {
+            ai_reply = `Bank alert parsed: Logged $${amount.toFixed(2)} at ${merchant} under ${category}. Checking balance reconciled to $${remaining_balance.toLocaleString('en-US', { minimumFractionDigits: 2 })}!`;
+        } else {
+            ai_reply = `Bank alert parsed: Logged $${amount.toFixed(2)} at ${merchant} under ${category}. Added to your transactions!`;
+        }
+    } else {
+        ai_reply = `Logged $${amount.toFixed(2)} at ${merchant} for ${category}. Added to your transactions!`;
     }
 
     return {
         amount,
         merchant,
         category,
-        date: 'Today',
-        ai_reply: `Logged $${amount.toFixed(2)} at ${merchant} for ${category}. Added to your transactions!`
+        date,
+        transaction_id,
+        remaining_balance,
+        card_or_account,
+        is_bank_alert: isBankAlert,
+        ai_reply
     };
 }
 
@@ -265,7 +362,7 @@ function loadUserData() {
 
 loadUserData();
 
-function recordExpense({ amount, merchant, category, date }) {
+function recordExpense({ amount, merchant, category, date, transaction_id, remaining_balance, card_or_account, is_bank_alert }) {
     const numAmount = Math.max(0, Number(amount) || 0);
     const validMerchant = String(merchant || 'Expense').trim();
     const validCategory = String(category || 'General').trim();
@@ -277,14 +374,26 @@ function recordExpense({ amount, merchant, category, date }) {
         merchant: validMerchant,
         amount: numAmount,
         category: validCategory,
+        transaction_id: transaction_id || undefined,
+        remaining_balance: (typeof remaining_balance === 'number' && Number.isFinite(remaining_balance)) ? remaining_balance : undefined,
+        card_or_account: card_or_account || undefined,
+        is_bank_alert: Boolean(is_bank_alert),
         type: 'expense'
     };
 
-    if (numAmount > 0) {
+    if (numAmount > 0 || (typeof remaining_balance === 'number' && remaining_balance >= 0)) {
         mockUserData.recentTransactions.unshift(newTx);
-        mockUserData.accounts.checking = Math.max(0, Math.round(((mockUserData.accounts.checking || 0) - numAmount) * 100) / 100);
+
+        // If alert provides exact remaining/available balance, automatically reconcile checking account
+        if (typeof remaining_balance === 'number' && Number.isFinite(remaining_balance) && remaining_balance >= 0) {
+            mockUserData.accounts.checking = Math.round(remaining_balance * 100) / 100;
+            console.log(`[Reconciliation] Reconciled checking account to alert balance: $${mockUserData.accounts.checking.toFixed(2)}`);
+        } else {
+            mockUserData.accounts.checking = Math.max(0, Math.round(((mockUserData.accounts.checking || 0) - numAmount) * 100) / 100);
+            console.log(`[Live State] Deducted $${numAmount.toFixed(2)} from checking. New checking: $${mockUserData.accounts.checking.toFixed(2)}`);
+        }
+
         saveUserData();
-        console.log(`[Live State] Deducted $${numAmount.toFixed(2)} from checking. New checking: $${mockUserData.accounts.checking.toFixed(2)}. Total transactions: ${mockUserData.recentTransactions.length}`);
     }
 
     return newTx;
@@ -364,8 +473,27 @@ app.post('/api/chat', async (req, res) => {
 
         console.log(`\n---> 1. Received user message: "${message}"`);
         
-        const routeResult = await routerModel.generateContent(`User message: "${message}"`);
-        const intent = routeResult.response.text().trim().toLowerCase();
+        let intent = 'expense';
+        try {
+            const routeResult = await routerModel.generateContent(`User message: "${message}"`);
+            intent = routeResult.response.text().trim().toLowerCase().replace(/[^a-z_]/g, '');
+        } catch (routerErr) {
+            console.warn("[Router] Gemini route fallback:", routerErr.message);
+        }
+
+        // Rule-based check if intent is not log_expense or was default
+        if (intent !== 'log_expense') {
+            const cleanMsg = message.toLowerCase();
+            if (
+                /(?:alert|notification|authorized|approved|declined|charge of|card ending|avail(?:able)? bal|balance:|ref:|txn|ref #)/i.test(cleanMsg) ||
+                /(spent|paid|bought|cost|charged)\s*(\$|\d)/i.test(cleanMsg) ||
+                /\$\s*\d+.*(on|at|for)/i.test(cleanMsg) ||
+                /(on lunch|on dinner|for coffee|at subway|at starbucks|at walmart|for groceries)/i.test(cleanMsg) ||
+                /(?:chase|citi|wells fargo|amex|apple card|venmo|paypal).*(?:\$|\d)/i.test(cleanMsg)
+            ) {
+                intent = 'log_expense';
+            }
+        }
         console.log(`---> 2. Router classified intent as: [${intent}]`);
 
         let selectedModel;
@@ -388,7 +516,7 @@ app.post('/api/chat', async (req, res) => {
         if (intent === 'log_expense') {
             let extractedData;
             try {
-                const result = await logExpenseModel.generateContent(`Extract transaction from: "${message}"`);
+                const result = await logExpenseModel.generateContent(`Extract transaction or bank alert from: "${message}"`);
                 extractedData = JSON.parse(result.response.text());
             } catch (err) {
                 console.warn("[LogExpense] Gemini extraction fallback:", err.message);
@@ -399,11 +527,28 @@ app.post('/api/chat', async (req, res) => {
             const merchant = extractedData.merchant || "Expense";
             const category = extractedData.category || "General";
             const date = extractedData.date || new Date().toISOString().split('T')[0];
+            const transaction_id = extractedData.transaction_id || undefined;
+            const remaining_balance = (typeof extractedData.remaining_balance === 'number' && Number.isFinite(extractedData.remaining_balance))
+                ? extractedData.remaining_balance
+                : undefined;
+            const card_or_account = extractedData.card_or_account || undefined;
+            const is_bank_alert = Boolean(extractedData.is_bank_alert);
 
-            const newTx = recordExpense({ amount, merchant, category, date });
+            const newTx = recordExpense({
+                amount,
+                merchant,
+                category,
+                date,
+                transaction_id,
+                remaining_balance,
+                card_or_account,
+                is_bank_alert
+            });
 
-            const reply = extractedData.ai_reply || `Logged $${amount.toFixed(2)} at ${merchant} under ${category}. Added to your transactions automatically!`;
-            console.log(`---> 3. Log Expense Agent extracted:`, { amount, merchant, category });
+            const reply = extractedData.ai_reply || (remaining_balance != null
+                ? `Bank alert parsed: Logged $${amount.toFixed(2)} at ${merchant} under ${category}. Checking balance reconciled to $${remaining_balance.toLocaleString('en-US', { minimumFractionDigits: 2 })}!`
+                : `Logged $${amount.toFixed(2)} at ${merchant} under ${category}. Added to your transactions automatically!`);
+            console.log(`---> 3. Log Expense Agent extracted:`, { amount, merchant, category, remaining_balance, transaction_id, is_bank_alert });
 
             const totalBalance = Math.round(Object.values(mockUserData.accounts).reduce((a, b) => a + b, 0) * 100) / 100;
 
@@ -417,6 +562,10 @@ app.post('/api/chat', async (req, res) => {
                     category,
                     date: newTx.date,
                     id: newTx.id,
+                    transaction_id,
+                    remaining_balance,
+                    card_or_account,
+                    is_bank_alert,
                     type: 'expense'
                 },
                 transaction: newTx,
@@ -576,7 +725,7 @@ app.post('/api/user/reset', (req, res) => {
     res.json({ success: true, message: "User data reset to default", data: mockUserData });
 });
 
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 if (require.main === module) {
     app.listen(PORT, () => {
         console.log(`\n✅ Multi-Agent Backend successfully running on http://localhost:${PORT}`);
